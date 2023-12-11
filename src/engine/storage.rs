@@ -1,0 +1,204 @@
+use ahash::HashMap;
+use crate::helpers::helpers::{DELTA_PREFIX};
+use datalog_syntax::{AnonymousGroundAtom, Program};
+use indexmap::IndexSet;
+use crate::evaluation::spj_processor::RuleEvaluator;
+
+pub type FactStorage = IndexSet<AnonymousGroundAtom, ahash::RandomState>;
+#[derive(Default)]
+pub struct RelationStorage {
+    pub(crate) inner: HashMap<String, FactStorage>,
+}
+
+impl RelationStorage {
+    pub fn get_relation(&self, relation_symbol: &str) -> &FactStorage {
+        return self.inner.get(relation_symbol).unwrap()
+    }
+    pub fn drain_relation(&mut self, relation_symbol: &str) -> Vec<AnonymousGroundAtom> {
+        let rel = self.inner.get_mut(relation_symbol).unwrap();
+
+        return rel.drain(..).collect();
+    }
+    pub fn drain_all_relations(
+        &mut self,
+    ) -> impl Iterator<Item = (String, Vec<AnonymousGroundAtom>)> + '_ {
+        let relations_to_be_drained: Vec<_> =
+            self.inner.iter().map(|(symbol, _)| symbol.clone()).collect();
+
+        relations_to_be_drained.into_iter().map(|relation_symbol| {
+            (
+                relation_symbol.clone(),
+                self.inner
+                    .get_mut(&relation_symbol)
+                    .unwrap()
+                    .drain(..)
+                    .collect::<Vec<_>>(),
+            )
+        })
+    }
+    pub fn drain_deltas(&mut self) {
+        let delta_relation_symbols: Vec<_> = self
+            .inner
+            .iter()
+            .map(|(symbol, _)| symbol.clone())
+            .filter(|relation_symbol| relation_symbol.starts_with(DELTA_PREFIX))
+            .collect();
+
+        delta_relation_symbols
+            .into_iter()
+            .for_each(|relation_symbol| {
+                if relation_symbol.starts_with(DELTA_PREFIX) {
+                    let delta_facts: Vec<_> = self.drain_relation(&relation_symbol);
+
+                    let current_non_delta_relation = self
+                        .inner
+                        .get_mut(relation_symbol.strip_prefix(DELTA_PREFIX).unwrap())
+                        .unwrap();
+
+                    delta_facts.into_iter().for_each(|fact| {
+                        current_non_delta_relation.insert(fact);
+                    });
+                }
+            });
+    }
+    pub fn insert_registered(
+        &mut self,
+        relation_symbol: &str,
+        registrations: impl Iterator<Item = AnonymousGroundAtom>,
+    ) {
+        let mut hashes = vec![];
+
+        registrations.into_iter().for_each(|fact| {
+            hashes.push(fact);
+        });
+
+        if let Some(relation) = self.inner.get_mut(relation_symbol) {
+            relation.extend(hashes)
+        } else {
+            let mut fresh_fact_storage = FactStorage::default();
+            fresh_fact_storage.extend(hashes);
+
+            self.inner
+                .insert(relation_symbol.to_string(), fresh_fact_storage);
+        }
+    }
+
+    pub fn insert_all(
+        &mut self,
+        relation_symbol: &str,
+        facts: impl Iterator<Item = AnonymousGroundAtom>,
+    ) {
+        if let Some(relation) = self.inner.get_mut(relation_symbol) {
+            relation.extend(facts.into_iter())
+        } else {
+            let mut fresh_fact_storage = FactStorage::default();
+            fresh_fact_storage.extend(facts.into_iter());
+
+            self.inner
+                .insert(relation_symbol.to_string(), fresh_fact_storage);
+        }
+    }
+    pub fn insert(&mut self, relation_symbol: &str, ground_atom: AnonymousGroundAtom) -> bool {
+        if let Some(relation) = self.inner.get_mut(relation_symbol) {
+            return relation.insert(ground_atom);
+        }
+
+        let mut fresh_fact_storage = FactStorage::default();
+        fresh_fact_storage.insert(ground_atom);
+
+        self.inner
+            .insert(relation_symbol.to_string(), fresh_fact_storage);
+
+        true
+    }
+    pub fn contains(&self, relation_symbol: &str, ground_atom: &AnonymousGroundAtom) -> bool {
+        if let Some(relation) = self.inner.get(relation_symbol) {
+            return relation.contains(ground_atom);
+        }
+
+        false
+    }
+
+    // Nonrecursive materialisation can be done sequentially in one pass.
+    pub fn materialize_nonrecursive_delta_program(&mut self, nonrecursive_program: &Program) {
+        for (idx, rule) in nonrecursive_program.inner.iter().enumerate() {
+            let evaluator = RuleEvaluator::new(self, rule);
+
+            let evaluation = evaluator.step();
+
+            let delta_relation_symbol = rule.head.symbol.clone();
+
+            let current_delta_relation = self.get_relation(&delta_relation_symbol);
+
+            let diff: FactStorage = evaluation
+                .into_iter()
+                .filter(|fact| !current_delta_relation.contains(fact))
+                .collect();
+
+            if idx == 0 {
+                (*self.inner.get_mut(&delta_relation_symbol).unwrap()) = diff.clone();
+            } else {
+                self.insert_all(&delta_relation_symbol, diff.clone().into_iter());
+            }
+
+            let relation_symbol = delta_relation_symbol.clone();
+            relation_symbol.strip_prefix(DELTA_PREFIX).unwrap();
+            self.insert_all(
+                delta_relation_symbol.strip_prefix(DELTA_PREFIX).unwrap(),
+                diff.into_iter(),
+            );
+        }
+    }
+    pub fn materialize_recursive_delta_program(&mut self, recursive_program: &Program) {
+        let evaluation_setup: Vec<_> = recursive_program
+            .inner
+            .iter()
+            .map(|rule| (&rule.head.symbol, RuleEvaluator::new(self, rule)))
+            .collect();
+
+        let evaluation = evaluation_setup
+            .into_iter()
+            .map(|(delta_relation_symbol, rule)| {
+                let out = rule.step().collect::<Vec<_>>();
+                (delta_relation_symbol, out)
+            })
+            .collect::<Vec<_>>();
+
+        evaluation.into_iter().enumerate().for_each(
+            |(idx, (delta_relation_symbol, current_delta_evaluation))| {
+                let curr = self.get_relation(delta_relation_symbol);
+
+                let diff: FactStorage = current_delta_evaluation
+                    .into_iter()
+                    .filter(|fact| !curr.contains(fact))
+                    .collect();
+
+                if idx == 0 {
+                    (*self.inner.get_mut(delta_relation_symbol).unwrap()) = diff.clone();
+                } else {
+                    self.insert_all(delta_relation_symbol, diff.clone().into_iter());
+                }
+
+                let relation_symbol = delta_relation_symbol.clone();
+                relation_symbol.strip_prefix(DELTA_PREFIX).unwrap();
+                self.insert_all(
+                    delta_relation_symbol.strip_prefix(DELTA_PREFIX).unwrap(),
+                    diff.into_iter(),
+                );
+            },
+        );
+    }
+
+    pub fn len(&self) -> usize {
+        return self
+            .inner
+            .iter()
+            .filter(|(symbol, _facts)| !symbol.starts_with(DELTA_PREFIX))
+            .map(|(_symbol, facts)| facts.len())
+            .sum();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        return self.len() == 0;
+    }
+}
